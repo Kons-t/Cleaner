@@ -2,10 +2,14 @@ package application
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
-	"github.com/AlecAivazis/survey/v2"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/huh/v2"
+	"charm.land/huh/v2/spinner"
 
 	"cleaner/internal/domain/enums"
 	"cleaner/internal/domain/paths"
@@ -19,7 +23,13 @@ import (
 	"cleaner/internal/usecase/xcode_clean"
 )
 
-const exitOption = "Выход"
+const (
+	exitOption = "Выход"
+	exitChoice = -1
+
+	exitHint   = "Esc / Ctrl+C — выход из программы"
+	cancelHint = "Esc / Ctrl+C — отмена и возврат в главное меню"
+)
 
 // menuItem — пункт корневого меню: короткая метка для вступительного сообщения,
 // заголовок пункта, обработчик и проверка, доступен ли модуль на этом устройстве.
@@ -41,6 +51,8 @@ type Application struct {
 	dsStoreCleaner       ds_store_clean.Cleaner
 	davinciCleaner       davinci_clean.Cleaner
 	xcodeCleaner         xcode_clean.Cleaner
+
+	keyMap *huh.KeyMap
 }
 
 // New создаёт Application с переданными зависимостями usecase-слоя.
@@ -63,6 +75,7 @@ func New(
 		dsStoreCleaner:       dsStoreCleaner,
 		davinciCleaner:       davinciCleaner,
 		xcodeCleaner:         xcodeCleaner,
+		keyMap:               newKeyMap(),
 	}
 }
 
@@ -133,41 +146,43 @@ func (a *Application) Run(ctx context.Context) error {
 		)
 	}
 
-	options := make([]string, 0, len(items)+1)
-	for _, item := range items {
-		options = append(options, item.title)
+	options := make([]huh.Option[int], 0, len(items)+1)
+	for i, item := range items {
+		options = append(options, huh.NewOption(item.title, i))
 	}
-	options = append(options, exitOption)
+	options = append(options, huh.NewOption(exitOption, exitChoice))
 
 	for {
-		var choice string
-		prompt := &survey.Select{
-			Message: "Выберите действие:",
-			Options: options,
+		choice := exitChoice
+		err := a.runField(ctx, huh.NewSelect[int]().
+			Title("Выберите действие:").
+			Description(exitHint).
+			Options(options...).
+			Value(&choice),
+		)
+		if errors.Is(err, huh.ErrUserAborted) {
+			return nil
 		}
-		if err := survey.AskOne(prompt, &choice); err != nil {
+		if err != nil {
 			return err
 		}
 
-		if choice == exitOption {
+		if choice == exitChoice {
 			return nil
 		}
 
-		for _, item := range items {
-			if item.title == choice {
-				if err := item.handler(ctx); err != nil {
-					fmt.Println("Ошибка:", err)
-				}
-				break
+		if err := items[choice].handler(ctx); err != nil {
+			if errors.Is(err, huh.ErrUserAborted) {
+				fmt.Println("Отменено.")
+				continue
 			}
+			fmt.Println("Ошибка:", err)
 		}
 	}
 }
 
 func (a *Application) runGoCacheMenu(ctx context.Context) error {
-	fmt.Println("Считаю размеры кешей, это может занять несколько секунд...")
-
-	status, err := a.goCleaner.Status(ctx)
+	status, err := withSpinner(ctx, "Считаю размеры кешей, это может занять несколько секунд...", a.goCleaner.Status)
 	if err != nil {
 		return err
 	}
@@ -175,38 +190,29 @@ func (a *Application) runGoCacheMenu(ctx context.Context) error {
 	fmt.Printf("GOCACHE:    %s (%s)\n", status.GoCache.Path, status.GoCache.SizeHuman)
 	fmt.Printf("GOMODCACHE: %s (%s)\n", status.GoModCache.Path, status.GoModCache.SizeHuman)
 
-	const allOption = "Всё сразу"
-
 	types := enums.AllCacheTypes()
-	options := make([]string, 0, len(types)+1)
+	options := make([]huh.Option[enums.CacheType], 0, len(types))
 	for _, t := range types {
-		options = append(options, t.Label())
+		options = append(options, huh.NewOption(t.Label(), t))
 	}
-	options = append(options, allOption)
 
-	var chosen []string
-	prompt := &survey.MultiSelect{
-		Message: "Что очистить (Space — отметить, Enter — подтвердить):",
-		Options: options,
-	}
-	if err := survey.AskOne(prompt, &chosen); err != nil {
+	var selected []enums.CacheType
+	if err := a.runField(ctx, huh.NewMultiSelect[enums.CacheType]().
+		Title("Что очистить (Space — отметить, Ctrl+A — выбрать всё, Enter — подтвердить):").
+		Description(cancelHint).
+		Options(options...).
+		Value(&selected),
+	); err != nil {
 		return err
 	}
 
-	if len(chosen) == 0 {
+	if len(selected) == 0 {
 		return nil
 	}
 
-	selected := resolveSelectedTypes(chosen, types, allOption)
-
-	confirmed := false
-	if err := survey.AskOne(&survey.Confirm{
-		Message: "Точно очистить выбранное? Действие необратимо.",
-	}, &confirmed); err != nil {
+	confirmed, err := a.confirm(ctx, "Точно очистить выбранное? Действие необратимо.")
+	if err != nil || !confirmed {
 		return err
-	}
-	if !confirmed {
-		return nil
 	}
 
 	results := a.goCleaner.Clean(ctx, selected)
@@ -222,9 +228,7 @@ func (a *Application) runGoCacheMenu(ctx context.Context) error {
 }
 
 func (a *Application) runHTTPResponsesMenu(ctx context.Context) error {
-	fmt.Println("Ищу .json-ответы HTTP-клиента в .idea/httpRequests...")
-
-	status, err := a.httpResponsesCleaner.Status(ctx)
+	status, err := withSpinner(ctx, "Ищу .json-ответы HTTP-клиента в .idea/httpRequests...", a.httpResponsesCleaner.Status)
 	if err != nil {
 		return err
 	}
@@ -236,14 +240,9 @@ func (a *Application) runHTTPResponsesMenu(ctx context.Context) error {
 
 	fmt.Printf("Найдено файлов: %d (%s) в %s\n", status.FileCount, status.SizeHuman, status.Root)
 
-	confirmed := false
-	if err := survey.AskOne(&survey.Confirm{
-		Message: fmt.Sprintf("Удалить все %d .json-файлов? Действие необратимо.", status.FileCount),
-	}, &confirmed); err != nil {
+	confirmed, err := a.confirm(ctx, fmt.Sprintf("Удалить все %d .json-файлов? Действие необратимо.", status.FileCount))
+	if err != nil || !confirmed {
 		return err
-	}
-	if !confirmed {
-		return nil
 	}
 
 	result := a.httpResponsesCleaner.Clean(ctx)
@@ -256,23 +255,16 @@ func (a *Application) runHTTPResponsesMenu(ctx context.Context) error {
 }
 
 func (a *Application) runHomebrewMenu(ctx context.Context) error {
-	fmt.Println("Смотрю, что можно почистить (brew cleanup --dry-run)...")
-
-	status, err := a.homebrewCleaner.Status(ctx)
+	status, err := withSpinner(ctx, "Смотрю, что можно почистить (brew cleanup --dry-run)...", a.homebrewCleaner.Status)
 	if err != nil {
 		return err
 	}
 
 	fmt.Println(status.Preview)
 
-	confirmed := false
-	if err := survey.AskOne(&survey.Confirm{
-		Message: "Выполнить brew cleanup? Действие необратимо.",
-	}, &confirmed); err != nil {
+	confirmed, err := a.confirm(ctx, "Выполнить brew cleanup? Действие необратимо.")
+	if err != nil || !confirmed {
 		return err
-	}
-	if !confirmed {
-		return nil
 	}
 
 	result, err := a.homebrewCleaner.Clean(ctx)
@@ -286,23 +278,19 @@ func (a *Application) runHomebrewMenu(ctx context.Context) error {
 }
 
 func (a *Application) runDockerMenu(ctx context.Context) error {
-	fmt.Println("Смотрю использование диска Docker (docker system df)...")
-
-	status, err := a.dockerCleaner.Status(ctx)
+	status, err := withSpinner(ctx, "Смотрю использование диска Docker (docker system df)...", a.dockerCleaner.Status)
 	if err != nil {
 		return err
 	}
 
 	fmt.Println(status.DiskUsage)
 
-	confirmed := false
-	if err := survey.AskOne(&survey.Confirm{
-		Message: "Выполнить docker system prune -f (остановленные контейнеры, висячие образы, неиспользуемые сети, build cache)? Действие необратимо.",
-	}, &confirmed); err != nil {
+	confirmed, err := a.confirm(
+		ctx,
+		"Выполнить docker system prune -f (остановленные контейнеры, висячие образы, неиспользуемые сети, build cache)? Действие необратимо.",
+	)
+	if err != nil || !confirmed {
 		return err
-	}
-	if !confirmed {
-		return nil
 	}
 
 	result, err := a.dockerCleaner.Clean(ctx)
@@ -316,9 +304,7 @@ func (a *Application) runDockerMenu(ctx context.Context) error {
 }
 
 func (a *Application) runLogsMenu(ctx context.Context) error {
-	fmt.Println("Ищу файлы логов...")
-
-	status, err := a.logsCleaner.Status(ctx)
+	status, err := withSpinner(ctx, "Ищу файлы логов...", a.logsCleaner.Status)
 	if err != nil {
 		return err
 	}
@@ -330,14 +316,9 @@ func (a *Application) runLogsMenu(ctx context.Context) error {
 
 	fmt.Printf("Найдено файлов: %d (%s) в %s\n", status.FileCount, status.SizeHuman, status.Root)
 
-	confirmed := false
-	if err := survey.AskOne(&survey.Confirm{
-		Message: fmt.Sprintf("Удалить все %d файлов логов? Действие необратимо.", status.FileCount),
-	}, &confirmed); err != nil {
+	confirmed, err := a.confirm(ctx, fmt.Sprintf("Удалить все %d файлов логов? Действие необратимо.", status.FileCount))
+	if err != nil || !confirmed {
 		return err
-	}
-	if !confirmed {
-		return nil
 	}
 
 	result := a.logsCleaner.Clean(ctx)
@@ -350,9 +331,7 @@ func (a *Application) runLogsMenu(ctx context.Context) error {
 }
 
 func (a *Application) runDSStoreMenu(ctx context.Context) error {
-	fmt.Println("Ищу .DS_Store файлы...")
-
-	status, err := a.dsStoreCleaner.Status(ctx)
+	status, err := withSpinner(ctx, "Ищу .DS_Store файлы...", a.dsStoreCleaner.Status)
 	if err != nil {
 		return err
 	}
@@ -364,14 +343,9 @@ func (a *Application) runDSStoreMenu(ctx context.Context) error {
 
 	fmt.Printf("Найдено файлов: %d (%s) в %s\n", status.FileCount, status.SizeHuman, status.Root)
 
-	confirmed := false
-	if err := survey.AskOne(&survey.Confirm{
-		Message: fmt.Sprintf("Удалить все %d файлов .DS_Store? Действие необратимо.", status.FileCount),
-	}, &confirmed); err != nil {
+	confirmed, err := a.confirm(ctx, fmt.Sprintf("Удалить все %d файлов .DS_Store? Действие необратимо.", status.FileCount))
+	if err != nil || !confirmed {
 		return err
-	}
-	if !confirmed {
-		return nil
 	}
 
 	result := a.dsStoreCleaner.Clean(ctx)
@@ -384,9 +358,7 @@ func (a *Application) runDSStoreMenu(ctx context.Context) error {
 }
 
 func (a *Application) runDavinciMenu(ctx context.Context) error {
-	fmt.Println("Ищу файлы render cache DaVinci Resolve...")
-
-	status, err := a.davinciCleaner.Status(ctx)
+	status, err := withSpinner(ctx, "Ищу файлы render cache DaVinci Resolve...", a.davinciCleaner.Status)
 	if err != nil {
 		return err
 	}
@@ -398,14 +370,9 @@ func (a *Application) runDavinciMenu(ctx context.Context) error {
 
 	fmt.Printf("Найдено файлов: %d (%s) в %s\n", status.FileCount, status.SizeHuman, status.Root)
 
-	confirmed := false
-	if err := survey.AskOne(&survey.Confirm{
-		Message: fmt.Sprintf("Удалить все %d файлов render cache? Действие необратимо.", status.FileCount),
-	}, &confirmed); err != nil {
+	confirmed, err := a.confirm(ctx, fmt.Sprintf("Удалить все %d файлов render cache? Действие необратимо.", status.FileCount))
+	if err != nil || !confirmed {
 		return err
-	}
-	if !confirmed {
-		return nil
 	}
 
 	result := a.davinciCleaner.Clean(ctx)
@@ -418,9 +385,7 @@ func (a *Application) runDavinciMenu(ctx context.Context) error {
 }
 
 func (a *Application) runXcodeMenu(ctx context.Context) error {
-	fmt.Println("Ищу папки проектов в DerivedData...")
-
-	status, err := a.xcodeCleaner.Status(ctx)
+	status, err := withSpinner(ctx, "Ищу папки проектов в DerivedData...", a.xcodeCleaner.Status)
 	if err != nil {
 		return err
 	}
@@ -432,14 +397,9 @@ func (a *Application) runXcodeMenu(ctx context.Context) error {
 
 	fmt.Printf("Найдено папок: %d (%s) в %s\n", status.EntryCount, status.SizeHuman, status.Root)
 
-	confirmed := false
-	if err := survey.AskOne(&survey.Confirm{
-		Message: fmt.Sprintf("Удалить все %d папок DerivedData? Действие необратимо.", status.EntryCount),
-	}, &confirmed); err != nil {
+	confirmed, err := a.confirm(ctx, fmt.Sprintf("Удалить все %d папок DerivedData? Действие необратимо.", status.EntryCount))
+	if err != nil || !confirmed {
 		return err
-	}
-	if !confirmed {
-		return nil
 	}
 
 	result := a.xcodeCleaner.Clean(ctx)
@@ -451,24 +411,67 @@ func (a *Application) runXcodeMenu(ctx context.Context) error {
 	return nil
 }
 
-func resolveSelectedTypes(chosen []string, types []enums.CacheType, allOption string) []enums.CacheType {
-	for _, c := range chosen {
-		if c == allOption {
-			return types
+// confirm спрашивает подтверждение с кнопками «Да»/«Нет».
+// При отмене через Esc / Ctrl+C возвращает huh.ErrUserAborted.
+func (a *Application) confirm(ctx context.Context, message string) (bool, error) {
+	confirmed := false
+	err := a.runField(ctx, huh.NewConfirm().
+		Title(message).
+		Description(cancelHint).
+		Affirmative("Да").
+		Negative("Нет").
+		Value(&confirmed),
+	)
+
+	return confirmed, err
+}
+
+// runField запускает одиночное поле как форму с общим keymap приложения.
+func (a *Application) runField(ctx context.Context, field huh.Field) error {
+	return huh.NewForm(huh.NewGroup(field)).
+		WithKeyMap(a.keyMap).
+		RunWithContext(ctx)
+}
+
+// newKeyMap — стандартный keymap huh, в котором выход/отмена доступны и по Esc.
+// Фильтр по «/» отключён: в нём Esc сбрасывает фильтр и конфликтовал бы с выходом,
+// а в коротких списках меню фильтр не нужен.
+func newKeyMap() *huh.KeyMap {
+	km := huh.NewDefaultKeyMap()
+	km.Quit = key.NewBinding(key.WithKeys("esc", "ctrl+c"))
+	km.Select.Filter.SetEnabled(false)
+	km.MultiSelect.Filter.SetEnabled(false)
+
+	return km
+}
+
+// withSpinner выполняет action, показывая спиннер с заголовком title.
+// Прерывание спиннера по Ctrl+C возвращается как huh.ErrUserAborted.
+// action при этом не останавливается сразу, поэтому спиннер используется
+// только для операций чтения (Status), но не для удаления.
+func withSpinner[T any](ctx context.Context, title string, action func(ctx context.Context) (T, error)) (T, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var result T
+	err := spinner.New().
+		Title(title).
+		Context(ctx).
+		ActionWithErr(func(ctx context.Context) error {
+			var actionErr error
+			result, actionErr = action(ctx)
+
+			return actionErr
+		}).
+		Run()
+	if err != nil {
+		var zero T
+		if errors.Is(err, tea.ErrInterrupted) {
+			return zero, huh.ErrUserAborted
 		}
+
+		return zero, err
 	}
 
-	labelToType := make(map[string]enums.CacheType, len(types))
-	for _, t := range types {
-		labelToType[t.Label()] = t
-	}
-
-	selected := make([]enums.CacheType, 0, len(chosen))
-	for _, c := range chosen {
-		if t, ok := labelToType[c]; ok {
-			selected = append(selected, t)
-		}
-	}
-
-	return selected
+	return result, nil
 }
